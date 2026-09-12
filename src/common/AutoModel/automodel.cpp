@@ -8,6 +8,14 @@
 #include "AutoModel/automodel.hpp"
 
 
+ModelRequestError::ModelRequestError(
+    int http_code, bool session_cleared, std::string message)
+    : std::runtime_error(std::move(message)),
+      http_code_(http_code), session_cleared_(session_cleared) {}
+
+int ModelRequestError::http_code() const noexcept { return http_code_; }
+bool ModelRequestError::session_cleared() const noexcept { return session_cleared_; }
+
 AutoModel::AutoModel(flm_rt::device* npu_device_inst, std::string current_model) {
     this->npu_device_inst = npu_device_inst;
     this->current_model = current_model;
@@ -128,32 +136,47 @@ void AutoModel::_shared_load_model(std::string model_path, json model_info, int 
         header_print("FLM", "Model already loaded: " << this->model_path);
         return;
     }
+    const int context_length = default_context_length != -1
+        ? default_context_length
+        : model_info["default_context_length"].get<int>();
+    this->_shared_initialize_model_state(
+        std::move(model_path), std::move(model_info), context_length);
+    this->_shared_initialize_legacy_npu(enable_preemption);
+}
 
-    this->model_path = model_path;
+void AutoModel::_shared_initialize_model_state(
+    std::string model_path, json, int context_length) {
+    this->model_path = std::move(model_path);
     header_print("FLM", "Loading model: " << this->model_path);
     this->lm_config = std::make_unique<LM_Config>();
     this->lm_config->from_pretrained(this->model_path);
+    this->MAX_L = context_length;
+    this->is_model_loaded = true;
+    this->token_history.clear();
+    this->token_history.reserve(this->MAX_L);
+    this->tokenizer = std::make_unique<Tokenizer>(this->model_path);
+    this->last_token = -1;
+    this->total_tokens = 0;
+}
+
+void AutoModel::_shared_initialize_legacy_npu(bool enable_preemption) {
     if (this->npu_device_inst == nullptr) {
         header_print("ERROR", "NPU device instance is nullptr");
         exit(1);
     }
-    this->npu = std::make_unique<npu_xclbin_manager>(npu_device::device_npu2, this->npu_device_inst, enable_preemption);
+    this->npu = std::make_unique<npu_xclbin_manager>(
+        npu_device::device_npu2, this->npu_device_inst, enable_preemption);
     this->enable_preemption = enable_preemption;
-    // Set context length: use provided value if not -1, otherwise use model default
-    if (default_context_length != -1) {
-        this->MAX_L = default_context_length;
-    } else {
-        this->MAX_L = model_info["default_context_length"];
-    }
-    
-    this->is_model_loaded = true;
+}
 
-    this->token_history.clear();
-    this->token_history.reserve(this->MAX_L);
-    this->tokenizer = std::make_unique<Tokenizer>(this->model_path);
-
-    this->last_token = -1;
-    this->total_tokens = 0;
+std::string AutoModel::generate_with_prompt(
+    chat_meta_info_t& meta_info,
+    lm_uniform_input_t& input,
+    int length_limit,
+    std::ostream& os,
+    std::function<bool()> is_cancelled) {
+    if (!insert(meta_info, input, is_cancelled)) return {};
+    return generate(meta_info, length_limit, os, std::move(is_cancelled));
 }
 
 bool AutoModel::_shared_insert(chat_meta_info_t& meta_info, std::vector<int>& tokens, std::function<bool()> is_cancelled, void* payload, int first_len_run) {
@@ -231,6 +254,14 @@ buffer<bf16> AutoModel::_chunked_insert(chat_meta_info_t& meta_info, std::vector
     }
     buffer<bf16> y;
     if (max_prefill_len < 512) {
+        if (is_cancelled()) {
+            meta_info.stop_reason = CANCEL_DETECTED;
+            buffer_.clear();
+            current_mode_ = StreamEventType::CONTENT;
+            tool_name_.clear();
+            is_in_tool_block_ = false;
+            return y;
+        }
         y = this->lm_engine->prefill(tokens, payload);
     }
     else{
@@ -242,19 +273,18 @@ buffer<bf16> AutoModel::_chunked_insert(chat_meta_info_t& meta_info, std::vector
         }
         int chunks = (tokens.size() + max_prefill_len - 1) / max_prefill_len;
         for (int i = 0; i < chunks; i++) {
+            int start = i * max_prefill_len;
+            int end = std::min(static_cast<int>(tokens.size()), (i + 1) * max_prefill_len);
+            std::vector<int> chunk_tokens(tokens.begin() + start, tokens.begin() + end);
+            header_print("FLM", "Prefill chunk " + std::to_string(i+1) + "/" + std::to_string(chunks) + " with " + std::to_string(chunk_tokens.size()) + " tokens");
             if (is_cancelled()) {
                 meta_info.stop_reason = CANCEL_DETECTED;
-                // reset stream content 
                 buffer_.clear();
                 current_mode_ = StreamEventType::CONTENT;
                 tool_name_.clear();
                 is_in_tool_block_ = false;
                 break;
             }
-            int start = i * max_prefill_len;
-            int end = std::min(static_cast<int>(tokens.size()), (i + 1) * max_prefill_len);
-            std::vector<int> chunk_tokens(tokens.begin() + start, tokens.begin() + end);
-            header_print("FLM", "Prefill chunk " + std::to_string(i+1) + "/" + std::to_string(chunks) + " with " + std::to_string(chunk_tokens.size()) + " tokens");
             buffer<bf16> chunk_y = this->lm_engine->prefill(chunk_tokens, (i == 0)? payload : nullptr);
             if (i == chunks - 1) {
                 y = chunk_y;
